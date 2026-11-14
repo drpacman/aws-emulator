@@ -95,6 +95,26 @@ fn a_record_set_renders_the_members_its_declaration_states() {
             ),
         ),
         (
+            "an alias record that leaves EvaluateTargetHealth to the type's default of false",
+            || {
+                serde_json::json!({
+                    "Name": "alias.example.com",
+                    "Type": "A",
+                    "AliasTarget": {
+                        "HostedZoneId": "Z35SXDOTRQ7X7K",
+                        "DNSName": "my-alb-1234567890.us-east-1.elb.amazonaws.com"
+                    }
+                })
+            },
+            Some(
+                "<ResourceRecordSet><Name>alias.example.com</Name><Type>A</Type>\
+                     <AliasTarget><HostedZoneId>Z35SXDOTRQ7X7K</HostedZoneId>\
+                     <DNSName>my-alb-1234567890.us-east-1.elb.amazonaws.com</DNSName>\
+                     <EvaluateTargetHealth>false</EvaluateTargetHealth></AliasTarget>\
+                     </ResourceRecordSet>",
+            ),
+        ),
+        (
             "a geolocation record and a health check",
             || {
                 serde_json::json!({

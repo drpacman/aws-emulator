@@ -117,6 +117,9 @@ impl Owner {
             Self::AppConfigResource(kind) => {
                 appconfig_resources::create(ctx, region, kind, resource, propagated).await
             }
+            Self::Elbv2Resource(kind) => {
+                elbv2_resources::create(ctx, region, kind, resource, propagated).await
+            }
         }
     }
 
@@ -200,6 +203,12 @@ impl Owner {
             // An application, an environment, a configuration profile and a deployment
             // strategy each exist from the moment their own create answers.
             Self::AppConfigResource(_) => Ok(appconfig_resources::ready()),
+            // A load balancer is answered `provisioning` and waited for until Elastic Load
+            // Balancing reports it `active`; a target group, a listener and a rule are in
+            // force as their create answers ([`elbv2_resources::readiness`]).
+            Self::Elbv2Resource(kind) => {
+                elbv2_resources::readiness(ctx, region, kind, physical_resource_id).await
+            }
         }
     }
 
@@ -275,6 +284,12 @@ impl Owner {
             // came back with that same create, so there is nothing left to read once the
             // resource is up.
             Self::AppConfigResource(_) => Ok(BTreeMap::new()),
+            // A load balancer's DNS name and canonical hosted zone are read again once it is
+            // active, so a declaration withheld behind it resolves against what Elastic Load
+            // Balancing reports ([`elbv2_resources::ready_attributes`]).
+            Self::Elbv2Resource(kind) => {
+                elbv2_resources::ready_attributes(ctx, region, kind, physical_resource_id).await
+            }
         }
     }
 
@@ -351,6 +366,7 @@ impl Owner {
             // no state a deleted application, environment, profile or strategy is still being
             // removed in.
             Self::AppConfigResource(_) => Ok(appconfig_resources::removal()),
+            Self::Elbv2Resource(_) => Ok(elbv2_resources::removal()),
         }
     }
 
@@ -461,6 +477,10 @@ impl Owner {
             Self::AppConfigResource(kind) => {
                 appconfig_resources::update(ctx, region, kind, resource, declared).await
             }
+            // No `Modify…` path is wired for these types yet, so a changed declaration is
+            // reported as NOT applied rather than as a success that dropped the caller's
+            // change.
+            Self::Elbv2Resource(_) => Ok(None),
         }
     }
 
@@ -538,6 +558,9 @@ impl Owner {
             // The tags of an AppConfig resource that already exists are reconciled by no arm
             // here yet ([`Provisioner::retag`]'s own default), so nothing is asked about them.
             Self::AppConfigResource(_) => Ok(()),
+            // The tags of an existing Elastic Load Balancing resource are reconciled by no arm
+            // here yet ([`Provisioner::retag`]'s own default), so nothing is asked about them.
+            Self::Elbv2Resource(_) => Ok(()),
         }
     }
 
@@ -645,6 +668,11 @@ impl Owner {
             Self::AppConfigResource(kind) => {
                 appconfig_resources::delete(ctx, region, kind, resource).await
             }
+            // Elastic Load Balancing takes no snapshot of a load balancer, a target group, a
+            // listener or a rule on the way out: there is no such call.
+            Self::Elbv2Resource(kind) => {
+                elbv2_resources::delete(ctx, region, kind, resource).await
+            }
         }
     }
 
@@ -735,6 +763,9 @@ impl Owner {
             Self::AppConfigResource(kind) => {
                 appconfig_resources::actual_configuration(ctx, region, kind, resource).await
             }
+            // Nothing is read back for drift detection yet, so nothing of these resources is
+            // reported as drifted rather than guessed at.
+            Self::Elbv2Resource(_) => Ok(None),
         }
     }
 
@@ -771,6 +802,8 @@ impl Owner {
             Self::ApplicationAutoScaling(_) => message.to_string(),
             // AWS AppConfig's does the same.
             Self::AppConfigResource(_) => message.to_string(),
+            // Elastic Load Balancing's does the same.
+            Self::Elbv2Resource(_) => message.to_string(),
         }
     }
 }

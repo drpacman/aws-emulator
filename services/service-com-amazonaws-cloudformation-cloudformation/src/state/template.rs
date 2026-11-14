@@ -2407,6 +2407,33 @@ pub fn arn_attributes(resource_type: &str, arn: &str) -> Vec<(String, String)> {
 /// [`super::provisioning`](crate::state::provisioning) learns, and the composite primary
 /// identifier a BINDING's own resolved properties make ([`composite_identity`]).
 pub fn adopt_identity(resource: &mut StoredResource, identity: String) {
+    // The uniform `Arn`/`<Type>Arn` were read off the identity being REPLACED wherever the
+    // convention built them from it ([`conventional_attributes`]): the ARN IS the id for a
+    // type whose `Ref` returns its ARN, and the id is the ARN's last segment for one whose
+    // ARN ends in it. Either way they are brought into step with the identity adopted, so
+    // `Fn::GetAtt <resource>.Arn` cannot name a resource the owning service never made. An
+    // ARN the type's own return values set some other way is left as it is.
+    let replaced = resource.physical_resource_id.clone();
+    if !replaced.is_empty() && replaced != identity {
+        for (attribute, _) in arn_attributes(&resource.resource_type, "") {
+            let Some(value) = resource.attributes.get(&attribute) else {
+                continue;
+            };
+            let followed = if *value == replaced {
+                Some(identity.clone())
+            } else {
+                ['/', ':'].iter().find_map(|separator| {
+                    value
+                        .strip_suffix(replaced.as_str())
+                        .filter(|head| head.ends_with(*separator))
+                        .map(|head| format!("{head}{identity}"))
+                })
+            };
+            if let Some(followed) = followed {
+                resource.attributes.insert(attribute, followed);
+            }
+        }
+    }
     for (attribute, value) in identity_attributes(&resource.resource_type, &identity) {
         // An attribute the convention already gave the resource is re-pointed; a new one
         // is added only while the resource is under its attribute bound, which is what

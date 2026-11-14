@@ -224,13 +224,18 @@ fn resumption_of(
     let mut expired: Vec<(super::super::stabilising::StabilisationBarrier, String)> = Vec::new();
     let mut resumable: Vec<super::super::stabilising::StabilisationBarrier> = Vec::new();
     for barrier in withheld {
-        if barrier.has_expired(now) {
-            let reason = barrier.not_stabilised_reason(&barrier.reported_state);
-            expired.push((barrier, reason));
-            continue;
-        }
+        // Whether what it waits for has answered is asked FIRST. Its dependencies' waits are
+        // settled at the instant their owning services reached the state awaited, whether or
+        // not anybody read the stack then ([`super::advance_stabilisations`]); a dependency
+        // that never got there failed its OWN wait, which is at least as long as this one.
+        // So a withheld resource none of whose dependencies is still waiting was released in
+        // time, however late the read that notices it — and only one still held behind a
+        // dependency that has not answered can have run out.
         if !awaits_a_dependency(&barrier.logical_id, &dependencies, &waiting) {
             resumable.push(barrier);
+        } else if barrier.has_expired(now) {
+            let reason = barrier.not_stabilised_reason(&barrier.reported_state);
+            expired.push((barrier, reason));
         }
     }
     if resumable.is_empty() && expired.is_empty() {

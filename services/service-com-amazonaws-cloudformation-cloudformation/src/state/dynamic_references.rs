@@ -119,6 +119,10 @@ pub(super) struct Resolution {
     /// report: as `deployed`, except that a reference whose value is a secret is left
     /// exactly as the template wrote it.
     pub(super) recorded: Value,
+    /// The value each reference resolved to, keyed by the reference as written — kept so
+    /// the same answers can be put into a document the deployment re-resolves later
+    /// ([`Self::reapplied`]) without asking any store a second time.
+    values: BTreeMap<String, Resolved>,
 }
 
 impl Resolution {
@@ -128,6 +132,19 @@ impl Resolution {
         Self {
             deployed: properties.clone(),
             recorded: properties.clone(),
+            values: BTreeMap::new(),
+        }
+    }
+
+    /// This resolution's answers put into `properties` — the SAME resource's declaration
+    /// evaluated again, against the identities its dependencies were really created under
+    /// ([`super::provisioning::reconcile`]). The references are the template's own text, so
+    /// re-evaluating the intrinsics around them leaves each where it stood.
+    pub(super) fn reapplied(&self, properties: &Value) -> Self {
+        Self {
+            deployed: substituted(properties, &self.values, true, 0),
+            recorded: substituted(properties, &self.values, false, 0),
+            values: self.values.clone(),
         }
     }
 }
@@ -215,6 +232,7 @@ async fn resolve(
     Ok(Resolution {
         deployed: substituted(properties, &resolutions, true, 0),
         recorded: substituted(properties, &resolutions, false, 0),
+        values: resolutions,
     })
 }
 

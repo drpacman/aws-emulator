@@ -790,7 +790,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cause.
         let property_failure = (input.disable_validation != Some(true)
             && unresolved_cross_stack.is_none())
-            .then(|| crate::state::property_validation::failure(&stack.current_resources()))
+            .then(|| stack.property_validation_failure())
             .flatten();
         let refused_deployment = transform_failure
             .or(unresolved_cross_stack)
@@ -804,7 +804,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the calls that create the stack's resources run after it, and each of those
         // reaches another service's own handler, which takes that service's lock — a
         // client reading THIS service meanwhile must not be blocked behind them.
-        let (stack_id, declared, provenance) = {
+        let (stack_id, declared, declarations, provenance) = {
             let mut store = state.lock();
             store.settle(now);
 
@@ -919,6 +919,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // whose owning services now have to create them, and the stack identity and
             // tags CloudFormation tags each of them with.
             let declared = stack.current_resources().to_vec();
+            // ...what those declarations are evaluated against again as the walk reaches
+            // each one ([`crate::state::provisioning::Declarations`])...
+            let declarations = stack.declarations();
             // ...and which names the OTHER live stacks of the Region already manage, read
             // here because the walk below holds no lock: a resource whose name one of them
             // owns fails in CloudFormation's own words
@@ -928,7 +931,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ..stack.provenance()
             };
             store.stacks.push(stack);
-            (stack_id, declared, provenance)
+            (stack_id, declared, declarations, provenance)
         };
 
         // "Creates a stack as specified in the template": each declared resource is
@@ -949,7 +952,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::service_role::ServiceRole::of(&*self.engine, input.role_arn.as_deref());
         let materialised = crate::state::service_role::acting_as(
             ::std::sync::Arc::clone(&role),
-            crate::state::provisioning::reconcile(
+            crate::state::provisioning::reconcile_declared(
                 ctx,
                 &region,
                 &provenance,
@@ -960,6 +963,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // its own rollback — that walk is the one below, under the policies the
                 // request asked for.
                 crate::state::provisioning::Policies::Honoured,
+                declarations.as_ref(),
             ),
         )
         .await;

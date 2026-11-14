@@ -1044,7 +1044,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The preconditions are re-asserted HERE, under the writing lock, rather than
         // trusted from the read above: between the two, another request may have deleted
         // the stack or started an operation on it, and only one update may be in flight.
-        let (stack_id, region, declared, previous_resources, provenance, refused_deployment) = {
+        let (
+            stack_id,
+            region,
+            declared,
+            declarations,
+            previous_resources,
+            provenance,
+            refused_deployment,
+        ) = {
             let mut store = state.lock();
             // What a `Fn::ImportValue` in the submitted template resolves against: the
             // exported output values in force in the Region this request is signed for,
@@ -1231,7 +1239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // refusal is the one diagnostic for every property whose value it took away.
             let property_failure = (input.disable_validation != Some(true)
                 && unresolved_cross_stack.is_none())
-                .then(|| crate::state::property_validation::failure(&stack.current_resources()))
+                .then(|| stack.property_validation_failure())
                 .flatten();
             if let Some(failure) = &property_failure {
                 stack.record_validation_failure(
@@ -1259,6 +1267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stack.stack_id.clone(),
                 stack.region.clone(),
                 stack.current_resources().to_vec(),
+                // What those declarations are evaluated against again as the walk reaches
+                // each one ([`crate::state::provisioning::Declarations`]).
+                stack.declarations(),
                 previous_resources,
                 crate::state::provisioning::StackProvenance {
                     managed_names: managed,
@@ -1280,7 +1291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let role = crate::state::service_role::ServiceRole::of(&*self.engine, role_in_force.as_deref());
         let materialised = crate::state::service_role::acting_as(
             role,
-            crate::state::provisioning::reconcile(
+            crate::state::provisioning::reconcile_declared(
                 ctx,
                 &region,
                 &provenance,
@@ -1291,6 +1302,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // no longer declares, so that resource's own `DeletionPolicy` decides what
                 // becomes of it.
                 crate::state::provisioning::Policies::Honoured,
+                declarations.as_ref(),
             ),
         )
         .await;

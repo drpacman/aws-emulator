@@ -51,6 +51,18 @@
 //! absent too ([`super::template::resolve_properties`] drops such a property rather than
 //! guessing a value for it).
 //!
+//! The one exception is a property whose DECLARED value reads an attribute of another
+//! resource of the same template (`Fn::GetAtt`, or a `${Name.Attribute}` inside `Fn::Sub`).
+//! CloudFormation resolves such a reference when it provisions the resource, once the
+//! resource it reads has been created — so before deployment the value is not absent, it is
+//! not known yet. An attribute only the owning service reports (a load balancer's
+//! `CanonicalHostedZoneID`, an endpoint a cluster is assigned) has no value until that
+//! service has created the resource, and this stage must not report such a property as
+//! missing: the deployment resolves it when the resource it reads is up
+//! ([`super::provisioning`]), and an attribute that resource never publishes fails the
+//! consuming resource there with CloudFormation's own attribute error
+//! ([`known_once_created`]).
+//!
 //! ## Where the value sets come from
 //!
 //! [`CONSTRAINED_PROPERTIES`] is a catalogue: one row per (resource type, property) whose
@@ -76,6 +88,7 @@
 
 use ::serde_json::Value;
 
+use super::template::DeclaredResource;
 use super::StoredResource;
 
 /// One property whose admitted values its type's contract publishes.
@@ -300,9 +313,17 @@ const PROPERTIES_SECTION: &str = "Properties";
 /// failure reported is the one the operation would have run into first, and each resource is
 /// judged for a MISSING required property before the values it does carry: a property that
 /// is not there has no value to hold to a published set.
-pub fn failure(declared: &[StoredResource]) -> Option<PropertyFailure> {
+///
+/// `declarations` is the template's resources as it DECLARES them, intrinsic functions
+/// unevaluated, which is where a property reading another resource's attribute is told
+/// apart from one the template did not supply ([`known_once_created`]).
+pub fn failure(
+    declared: &[StoredResource],
+    declarations: &[DeclaredResource],
+) -> Option<PropertyFailure> {
     declared.iter().find_map(|resource| {
-        missing_required_property(resource).or_else(|| inadmissible_value(resource))
+        missing_required_property(resource, declared, declarations)
+            .or_else(|| inadmissible_value(resource))
     })
 }
 
@@ -310,21 +331,52 @@ pub fn failure(declared: &[StoredResource]) -> Option<PropertyFailure> {
 /// contract requires ([`REQUIRED_PROPERTIES`]) — the first such property in the order the
 /// contract publishes them; `None` for a type with no row, and for one carrying every
 /// property its row names.
-fn missing_required_property(resource: &StoredResource) -> Option<PropertyFailure> {
+fn missing_required_property(
+    resource: &StoredResource,
+    declared: &[StoredResource],
+    declarations: &[DeclaredResource],
+) -> Option<PropertyFailure> {
     REQUIRED_PROPERTIES
         .iter()
         .filter(|row| row.resource_type == resource.resource_type)
         .find_map(|row| {
-            let missing = row
-                .required
-                .iter()
-                .find(|property| resource.properties.get(*property).is_none())?;
+            let missing = row.required.iter().find(|property| {
+                resource.properties.get(*property).is_none()
+                    && !known_once_created(resource, property, declared, declarations)
+            })?;
             Some(PropertyFailure {
                 logical_id: resource.logical_id.clone(),
                 resource_type: resource.resource_type.clone(),
                 reason: missing_property_reason(missing),
                 path: properties_path(&resource.logical_id),
             })
+        })
+}
+
+/// Whether the declared `property` of `resource` reads an attribute of ANOTHER resource the
+/// stack declares — a value that exists only once that resource has been created, so its
+/// absence from the document resolved before deployment says nothing about the template.
+///
+/// A property that reads only parameters, `Ref`s or literals is judged as resolved: those
+/// have their values before anything is created.
+fn known_once_created(
+    resource: &StoredResource,
+    property: &str,
+    declared: &[StoredResource],
+    declarations: &[DeclaredResource],
+) -> bool {
+    let Some(expression) = declarations
+        .iter()
+        .find(|declaration| declaration.logical_id == resource.logical_id)
+        .and_then(|declaration| declaration.properties.get(property))
+    else {
+        return false;
+    };
+    super::template::references(expression)
+        .attribute_targets()
+        .any(|(target, _)| {
+            target != resource.logical_id
+                && declared.iter().any(|other| other.logical_id == target)
         })
 }
 
@@ -487,7 +539,7 @@ mod tests {
         ];
         for (case, resource_type, property, properties, admitted) in rows {
             let resources = vec![declared("R", resource_type, properties.clone())];
-            let failed = failure(&resources);
+            let failed = failure(&resources, &[]);
             assert_eq!(
                 failed.is_none(),
                 *admitted,
@@ -582,7 +634,7 @@ mod tests {
         ];
         for (case, resource_type, properties, missing) in rows {
             let resources = vec![declared("R", resource_type, properties.clone())];
-            let failed = failure(&resources);
+            let failed = failure(&resources, &[]);
             assert_eq!(
                 failed.as_ref().map(|failure| failure.reason.clone()),
                 missing.map(missing_property_reason),
@@ -594,6 +646,71 @@ mod tests {
                     "case {case:?}: expected the resource's own properties path, got {failure:?}"
                 );
             }
+        }
+    }
+
+    /// RULE: a required property absent from the resolved document is MISSING only where the
+    /// template did not supply it from something it knows before deployment. One whose
+    /// declared value reads another resource's attribute is not known until that resource
+    /// is created, so it is left to the deployment; one reading a resource the template does
+    /// not declare, or reading the resource's own attribute, is still missing.
+    #[test]
+    fn a_property_reading_another_resources_attribute_is_not_missing() {
+        let declaration = |logical_id: &str, properties: Value| DeclaredResource {
+            logical_id: logical_id.to_string(),
+            resource_type: "AWS::SSM::Parameter".to_string(),
+            properties,
+            condition: None,
+            declaration: Value::Null,
+        };
+        // (case, the declared `Value`, whether the stage passes it)
+        let rows: &[(&str, Value, bool)] = &[
+            (
+                "an Fn::GetAtt of a resource of the template",
+                ::serde_json::json!({"Fn::GetAtt": ["Alb", "CanonicalHostedZoneID"]}),
+                true,
+            ),
+            (
+                "the short-form dotted Fn::GetAtt",
+                ::serde_json::json!({"Fn::GetAtt": "Alb.CanonicalHostedZoneID"}),
+                true,
+            ),
+            (
+                "an attribute inside Fn::Sub",
+                ::serde_json::json!({"Fn::Sub": "${Alb.DNSName}:80"}),
+                true,
+            ),
+            (
+                "an Fn::GetAtt of a resource the template does not declare",
+                ::serde_json::json!({"Fn::GetAtt": ["Nowhere", "Arn"]}),
+                false,
+            ),
+            (
+                "an Fn::GetAtt of the resource itself",
+                ::serde_json::json!({"Fn::GetAtt": ["Param", "Value"]}),
+                false,
+            ),
+            ("a Ref, which has its value before deployment", ::serde_json::json!({"Ref": "Missing"}), false),
+            ("no value declared at all", Value::Null, false),
+        ];
+        for (case, declared_value, passes) in rows {
+            // The resolved document carries `Type` but not `Value`: whatever the declaration
+            // said, resolving it before deployment produced nothing.
+            let resources = vec![
+                declared("Alb", "AWS::ElasticLoadBalancingV2::LoadBalancer", ::serde_json::json!({})),
+                declared("Param", "AWS::SSM::Parameter", ::serde_json::json!({"Type": "String"})),
+            ];
+            let mut properties = ::serde_json::json!({"Type": "String"});
+            if !declared_value.is_null() {
+                properties["Value"] = declared_value.clone();
+            }
+            let declarations = vec![declaration("Param", properties)];
+            let failed = failure(&resources, &declarations);
+            assert_eq!(
+                failed.is_none(),
+                *passes,
+                "case {case:?}: expected the stage to pass={passes:?}, got {failed:?}"
+            );
         }
     }
 
@@ -617,7 +734,7 @@ mod tests {
                 ::serde_json::json!({"AccessControl": "EverybodyRead"}),
             ),
         ];
-        let failed = failure(&resources);
+        let failed = failure(&resources, &[]);
         assert_eq!(
             failed.as_ref().map(|failure| failure.reason.as_str()),
             Some(

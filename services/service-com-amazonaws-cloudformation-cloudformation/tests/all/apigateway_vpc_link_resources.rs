@@ -21,9 +21,8 @@
 //! entirely, a value that is no ARN at all).
 //!
 //! The target ARNs are written by the rows rather than taken from a load balancer this stack
-//! created: an `AWS::ElasticLoadBalancingV2::LoadBalancer` is DECLARED-ONLY in this emulator
-//! — no Elastic Load Balancing call is made for one yet, which is its own issue — so what a
-//! row states is an ARN of the form that service writes for a network load balancer, which is
+//! created, so each row controls exactly which ARN API Gateway is handed: what a row states
+//! is an ARN of the form Elastic Load Balancing writes for a network load balancer, which is
 //! what API Gateway reads a `targetArns` entry as.
 //!
 //! Everything goes over the wire each service speaks through the one router `stack_lifecycle.rs`

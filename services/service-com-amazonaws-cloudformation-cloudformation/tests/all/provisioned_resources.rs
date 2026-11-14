@@ -1114,14 +1114,37 @@ fn is_load_balancer_arn(value: &str, type_code: &str, name: &str) -> bool {
         .is_some_and(is_elb_id)
 }
 
-/// Whether `value` is the DNS name of the load balancer named `name`:
-/// `<name>-<id>.<region>.elb.amazonaws.com`, prefixed `internal-` for an internal one.
-fn is_dns_name(value: &str, name: &str, internal: bool) -> bool {
+/// Whether `value` is the DNS name Elastic Load Balancing reports for the load balancer
+/// named `name`.
+///
+/// An APPLICATION load balancer in this emulator publishes the `host:port` of the socket it
+/// answers on — the address a client is handed has to be one something answers — and only
+/// where no socket can be opened the name AWS publishes,
+/// `<name>-<decimal id>.<region>.elb.amazonaws.com`, prefixed `internal-` for an internal
+/// one. A NETWORK load balancer's is `<name>-<hex id>.elb.<region>.amazonaws.com`, whatever
+/// its scheme (`my-network-load-balancer-1234567890abcdef.elb.us-west-2.amazonaws.com`).
+fn is_dns_name(value: &str, name: &str, type_code: &str, internal: bool) -> bool {
+    if type_code == "app" && is_socket_address(value) {
+        return true;
+    }
+    if type_code == "net" {
+        return value
+            .strip_prefix(&format!("{name}-"))
+            .and_then(|rest| rest.strip_suffix(&format!(".elb.{REGION}.amazonaws.com")))
+            .is_some_and(is_elb_id);
+    }
     let prefix = if internal { "internal-" } else { "" };
     value
         .strip_prefix(&format!("{prefix}{name}-"))
         .and_then(|rest| rest.strip_suffix(&format!(".{REGION}.elb.amazonaws.com")))
-        .is_some_and(is_elb_id)
+        .is_some_and(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Whether `value` is a `host:port` address: an IPv4 host and a decimal port.
+fn is_socket_address(value: &str) -> bool {
+    value.rsplit_once(':').is_some_and(|(host, port)| {
+        host.parse::<std::net::Ipv4Addr>().is_ok() && port.parse::<u16>().is_ok()
+    })
 }
 
 /// Whether `value` is the `<type>/<name>/<id>` path a load balancer's
@@ -1155,6 +1178,25 @@ fn cases() -> Vec<Case> {
                 "  AppName:\n",
                 "    Type: String\n",
                 "Resources:\n",
+                // The network the load balancer is placed in, created in Amazon EC2 by the
+                // same stack: Elastic Load Balancing places an application load balancer
+                // only in subnets EC2 holds, in at least two Availability Zones.
+                "  Vpc:\n",
+                "    Type: AWS::EC2::VPC\n",
+                "    Properties:\n",
+                "      CidrBlock: 10.0.0.0/16\n",
+                "  SubnetA:\n",
+                "    Type: AWS::EC2::Subnet\n",
+                "    Properties:\n",
+                "      VpcId: !Ref Vpc\n",
+                "      CidrBlock: 10.0.1.0/24\n",
+                "      AvailabilityZone: us-east-1a\n",
+                "  SubnetB:\n",
+                "    Type: AWS::EC2::Subnet\n",
+                "    Properties:\n",
+                "      VpcId: !Ref Vpc\n",
+                "      CidrBlock: 10.0.2.0/24\n",
+                "      AvailabilityZone: us-east-1b\n",
                 "  AppRepository:\n",
                 "    Type: AWS::ECR::Repository\n",
                 "    Properties:\n",
@@ -1167,7 +1209,7 @@ fn cases() -> Vec<Case> {
                 "      Port: 80\n",
                 "      Protocol: HTTP\n",
                 "      TargetType: ip\n",
-                "      VpcId: vpc-0123456789abcdef0\n",
+                "      VpcId: !Ref Vpc\n",
                 "  LoadBalancer:\n",
                 "    Type: AWS::ElasticLoadBalancingV2::LoadBalancer\n",
                 "    Properties:\n",
@@ -1175,8 +1217,8 @@ fn cases() -> Vec<Case> {
                 "      Scheme: internet-facing\n",
                 "      Type: application\n",
                 "      Subnets:\n",
-                "        - subnet-0123456789abcdef0\n",
-                "        - subnet-abcdef0123456789a\n",
+                "        - !Ref SubnetA\n",
+                "        - !Ref SubnetB\n",
                 "  TaskDefinition:\n",
                 "    Type: AWS::ECS::TaskDefinition\n",
                 "    Properties:\n",
@@ -1235,7 +1277,7 @@ fn cases() -> Vec<Case> {
                 form(
                     "LoadBalancerDnsName",
                     "shop-alb-<id>.us-east-1.elb.amazonaws.com",
-                    |value| is_dns_name(value, "shop-alb", false),
+                    |value| is_dns_name(value, "shop-alb", "app", false),
                 ),
                 form("LoadBalancerFullName", "app/shop-alb/<id>", |value| {
                     is_load_balancer_full_name(value, "app", "shop-alb")
@@ -1256,13 +1298,17 @@ fn cases() -> Vec<Case> {
             case: "json, an internal network load balancer and unnamed resources",
             stack_name: "warehouse",
             template: r#"{"Resources":{
+                 "Vpc":{"Type":"AWS::EC2::VPC","Properties":{"CidrBlock":"10.1.0.0/16"}},
+                 "Subnet":{"Type":"AWS::EC2::Subnet","Properties":{
+                   "VpcId":{"Ref":"Vpc"},"CidrBlock":"10.1.1.0/24",
+                   "AvailabilityZone":"us-east-1a"}},
                  "Balancer":{"Type":"AWS::ElasticLoadBalancingV2::LoadBalancer","Properties":{
                    "Name":"warehouse-internal",
                    "Scheme":"internal","Type":"network",
-                   "Subnets":["subnet-0123456789abcdef0"]}},
+                   "Subnets":[{"Ref":"Subnet"}]}},
                  "Group":{"Type":"AWS::ElasticLoadBalancingV2::TargetGroup","Properties":{
                    "Name":"warehouse-tg","Port":8080,"Protocol":"TCP","TargetType":"ip",
-                   "VpcId":"vpc-0123456789abcdef0"}},
+                   "VpcId":{"Ref":"Vpc"}}},
                  "Registry":{"Type":"AWS::ECR::Repository"},
                  "Task":{"Type":"AWS::ECS::TaskDefinition","Properties":{
                    "Cpu":"512","Memory":"1024","NetworkMode":"awsvpc",
@@ -1284,10 +1330,13 @@ fn cases() -> Vec<Case> {
                     "loadbalancer/net/warehouse-internal/<id>",
                     |value| is_load_balancer_arn(value, "net", "warehouse-internal"),
                 ),
+                // A network load balancer's host carries its ARN's hexadecimal id and states
+                // its scheme nowhere — the form Elastic Load Balancing publishes for that
+                // family, internal or not.
                 form(
                     "LoadBalancerDnsName",
-                    "internal-warehouse-internal-<id>.us-east-1.elb.amazonaws.com",
-                    |value| is_dns_name(value, "warehouse-internal", true),
+                    "warehouse-internal-<id>.elb.us-east-1.amazonaws.com",
+                    |value| is_dns_name(value, "warehouse-internal", "net", true),
                 ),
                 value("LoadBalancerName", "warehouse-internal".to_string()),
                 form(
@@ -1414,16 +1463,32 @@ async fn an_assigned_identifier_is_unique_per_resource_and_stable() {
     let case = "two load balancers and two target groups in one stack";
     let template = concat!(
         "Resources:\n",
+        "  Vpc:\n",
+        "    Type: AWS::EC2::VPC\n",
+        "    Properties:\n",
+        "      CidrBlock: 10.2.0.0/16\n",
+        "  SubnetA:\n",
+        "    Type: AWS::EC2::Subnet\n",
+        "    Properties:\n",
+        "      VpcId: !Ref Vpc\n",
+        "      CidrBlock: 10.2.1.0/24\n",
+        "      AvailabilityZone: us-east-1a\n",
+        "  SubnetB:\n",
+        "    Type: AWS::EC2::Subnet\n",
+        "    Properties:\n",
+        "      VpcId: !Ref Vpc\n",
+        "      CidrBlock: 10.2.2.0/24\n",
+        "      AvailabilityZone: us-east-1b\n",
         "  FirstBalancer:\n",
         "    Type: AWS::ElasticLoadBalancingV2::LoadBalancer\n",
         "    Properties:\n",
         "      Name: shared-name\n",
-        "      Subnets: [subnet-0123456789abcdef0]\n",
+        "      Subnets: [!Ref SubnetA, !Ref SubnetB]\n",
         "  SecondBalancer:\n",
         "    Type: AWS::ElasticLoadBalancingV2::LoadBalancer\n",
         "    Properties:\n",
         "      Name: second-alb\n",
-        "      Subnets: [subnet-0123456789abcdef0]\n",
+        "      Subnets: [!Ref SubnetA, !Ref SubnetB]\n",
         "  FirstGroup:\n",
         // The same NAME as the first load balancer: Elastic Load Balancing keeps the two
         // name spaces apart, and the ids it assigns them are still distinct.
@@ -1432,14 +1497,14 @@ async fn an_assigned_identifier_is_unique_per_resource_and_stable() {
         "      Name: shared-name\n",
         "      Port: 80\n",
         "      Protocol: HTTP\n",
-        "      VpcId: vpc-0123456789abcdef0\n",
+        "      VpcId: !Ref Vpc\n",
         "  SecondGroup:\n",
         "    Type: AWS::ElasticLoadBalancingV2::TargetGroup\n",
         "    Properties:\n",
         "      Name: second-tg\n",
         "      Port: 80\n",
         "      Protocol: HTTP\n",
-        "      VpcId: vpc-0123456789abcdef0\n",
+        "      VpcId: !Ref Vpc\n",
         "Outputs:\n",
         "  FirstBalancer:\n",
         "    Value: !Ref FirstBalancer\n",

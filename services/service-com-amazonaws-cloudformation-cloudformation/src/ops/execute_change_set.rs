@@ -301,6 +301,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stack_id,
             region,
             declared,
+            declarations,
             previous_resources,
             provenance,
             refused_deployment,
@@ -719,6 +720,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 withdraws_an_export_in_use.or_else(|| stack.unresolved_cross_stack_failure());
             let region = stack.region.clone();
             let declared = stack.current_resources().to_vec();
+            // What those declarations are evaluated against again as the walk reaches each
+            // one ([`crate::state::provisioning::Declarations`]).
+            let declarations = stack.declarations();
             // A resource the plan ADOPTS already exists in the service that owns it, and
             // executing the change set is what puts it under the stack's management: its
             // record is installed HERE, as a resource the stack HAS
@@ -791,6 +795,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stack_id,
                 region,
                 declared,
+                declarations,
                 previous_resources,
                 provenance,
                 refused_deployment,
@@ -813,7 +818,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::service_role::ServiceRole::of(&*self.engine, role_in_force.as_deref());
         let materialised = crate::state::service_role::acting_as(
             ::std::sync::Arc::clone(&role),
-            crate::state::provisioning::reconcile(
+            crate::state::provisioning::reconcile_declared(
                 ctx,
                 &region,
                 &provenance,
@@ -824,6 +829,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // declares is one CloudFormation stops managing: its own `DeletionPolicy`
                 // decides what becomes of it.
                 crate::state::provisioning::Policies::Honoured,
+                declarations.as_ref(),
             ),
         )
         .await;

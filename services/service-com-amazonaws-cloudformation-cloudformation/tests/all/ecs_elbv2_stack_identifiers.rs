@@ -54,10 +54,15 @@ use service_com_amazonaws_cloudformation_cloudformation::state::status;
 /// `targetgroup/my-targets/73e2d6bc24d8a067`).
 const ELBV2_ID_DIGITS: usize = 16;
 
-/// How many characters a load balancer's DNS name carries after its name: the SAME
-/// service-assigned id its ARN carries, which is the form the service that owns a load
-/// balancer mints.
+/// How many characters a NETWORK load balancer's DNS name carries after its name: the SAME
+/// service-assigned id its ARN carries
+/// (`my-network-load-balancer-1234567890abcdef.elb.us-west-2.amazonaws.com`).
 const ELBV2_DNS_LABEL_DIGITS: usize = ELBV2_ID_DIGITS;
+
+/// How many DECIMAL digits an APPLICATION load balancer's DNS name carries after its name,
+/// where it carries the name AWS publishes: an id minted for the host alone, not the one its
+/// ARN carries (`my-load-balancer-1234567890.us-west-2.elb.amazonaws.com`).
+const ALB_DNS_ID_DIGITS: usize = 10;
 
 /// How many characters the unique segment of a generated physical name carries
 /// (`<stack name>-<logical id>-<unique id>`).
@@ -74,9 +79,14 @@ fn ecs_head() -> String {
     format!("arn:aws:ecs:{REGION}:{ACCOUNT_ID}:")
 }
 
-/// The suffix a load balancer's DNS name ends in, under the Region it lives in.
+/// The suffix an APPLICATION load balancer's DNS name ends in, under the Region it lives in.
 fn dns_suffix() -> String {
     format!(".{REGION}.elb.amazonaws.com")
+}
+
+/// The suffix a NETWORK load balancer's DNS name ends in: `elb` comes before the Region.
+fn network_dns_suffix() -> String {
+    format!(".elb.{REGION}.amazonaws.com")
 }
 
 /// What one declared output must carry.
@@ -104,6 +114,13 @@ struct Expect {
     /// Whether the assigned run is CloudFormation's generated name segment (uppercase)
     /// rather than an id Elastic Load Balancing assigned (lowercase).
     generated: bool,
+    /// Whether the assigned run is DECIMAL — the id an application load balancer's host
+    /// carries — rather than hexadecimal.
+    decimal: bool,
+    /// Whether a `host:port` socket address also satisfies this row: the address an
+    /// APPLICATION load balancer in this emulator publishes as its `DNSName`, so that the
+    /// name a client is handed is one something answers on.
+    or_socket_address: bool,
     tail: String,
 }
 
@@ -160,6 +177,13 @@ fn embedding_with_id(head: impl Into<String>, from: &'static str, digits: usize)
 /// Whether `actual` is the value `expected` describes, against the other outputs of the
 /// same stack.
 fn holds(expected: &Expect, actual: &str, values: &BTreeMap<String, String>) -> bool {
+    if expected.or_socket_address
+        && actual.rsplit_once(':').is_some_and(|(host, port)| {
+            host.parse::<std::net::Ipv4Addr>().is_ok() && port.parse::<u16>().is_ok()
+        })
+    {
+        return true;
+    }
     let Some(mut rest) = actual.strip_prefix(&expected.head) else {
         return false;
     };
@@ -187,7 +211,9 @@ fn holds(expected: &Expect, actual: &str, values: &BTreeMap<String, String>) -> 
     let Some(assigned) = rest.strip_suffix(&expected.tail) else {
         return false;
     };
-    if expected.generated {
+    if expected.decimal {
+        assigned.len() == expected.digits && assigned.chars().all(|c| c.is_ascii_digit())
+    } else if expected.generated {
         is_upper_hex(assigned, expected.digits)
     } else {
         is_lower_hex(assigned, expected.digits)
@@ -206,6 +232,8 @@ fn described(expected: &Expect, values: &BTreeMap<String, String>) -> String {
         .unwrap_or_default();
     let assigned = if expected.digits == 0 {
         String::new()
+    } else if expected.decimal {
+        format!("<{} decimal digits>", expected.digits)
     } else if expected.generated {
         format!("<{} uppercase hexadecimal characters>", expected.digits)
     } else {
@@ -250,6 +278,22 @@ fn cases() -> Vec<Case> {
                    every one named by the template",
             stack_name: "alb-routing",
             template: r#"Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: us-east-1a
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: us-east-1b
   Alb:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
@@ -257,8 +301,8 @@ fn cases() -> Vec<Case> {
       Type: application
       Scheme: internet-facing
       Subnets:
-        - subnet-00000000000000001
-        - subnet-00000000000000002
+        - !Ref SubnetA
+        - !Ref SubnetB
   Tg:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
@@ -266,7 +310,7 @@ fn cases() -> Vec<Case> {
       Port: 80
       Protocol: HTTP
       TargetType: ip
-      VpcId: vpc-00000000000000001
+      VpcId: !Ref Vpc
   Listener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
@@ -328,12 +372,15 @@ Outputs:
                 ("AlbArn", embedding(format!("{elb}loadbalancer/"), "AlbFullName")),
                 (
                     "AlbDns",
-                    // The DNS name carries the SAME service-assigned id as the ARN: one
-                    // load balancer, one id, however a client reaches it.
+                    // An application load balancer in this emulator publishes the
+                    // `host:port` of the socket it answers on, and otherwise the name AWS
+                    // publishes, whose host carries a DECIMAL id minted for the host alone
+                    // (`my-load-balancer-1234567890.us-west-2.elb.amazonaws.com`).
                     Expect {
                         head: "probe-alb-".to_string(),
-                        embeds: Some("AlbFullName"),
-                        embeds_after: "/probe-alb/",
+                        digits: ALB_DNS_ID_DIGITS,
+                        decimal: true,
+                        or_socket_address: true,
                         tail: dns_suffix(),
                         ..Expect::default()
                     },
@@ -390,19 +437,23 @@ Outputs:
             ],
         },
         Case {
-            // The kind of load balancer decides the segment its ARN carries, and the
-            // scheme decides whether its DNS name begins `internal-`. Neither is named by
+            // The kind of load balancer decides the segment its ARN carries and the form of
+            // its DNS name (a network one's states no scheme). Neither is named by
             // the template, so each identifier is built from the name CloudFormation
             // generated. JSON spelling, long-form intrinsics.
             case: "a network and a gateway load balancer the template does not name",
             stack_name: "unnamed-lbs",
             template: r#"{"Resources":{
+                   "Vpc":{"Type":"AWS::EC2::VPC","Properties":{"CidrBlock":"10.1.0.0/16"}},
+                   "Subnet":{"Type":"AWS::EC2::Subnet","Properties":{
+                     "VpcId":{"Ref":"Vpc"},"CidrBlock":"10.1.1.0/24",
+                     "AvailabilityZone":"us-east-1a"}},
                    "Nlb":{"Type":"AWS::ElasticLoadBalancingV2::LoadBalancer",
                      "Properties":{"Type":"network","Scheme":"internal",
-                       "Subnets":["subnet-00000000000000001"]}},
+                       "Subnets":[{"Ref":"Subnet"}]}},
                    "Glb":{"Type":"AWS::ElasticLoadBalancingV2::LoadBalancer",
                      "Properties":{"Type":"gateway",
-                       "Subnets":["subnet-00000000000000001"]}}},
+                       "Subnets":[{"Ref":"Subnet"}]}}},
                  "Outputs":{
                    "NlbName":{"Value":{"Fn::GetAtt":["Nlb","LoadBalancerName"]}},
                    "NlbFullName":{"Value":{"Fn::GetAtt":["Nlb","LoadBalancerFullName"]}},
@@ -428,15 +479,16 @@ Outputs:
                     "NlbConventionalArn",
                     embedding(format!("{elb}loadbalancer/"), "NlbFullName"),
                 ),
-                // "The DNS name of an internal load balancer begins with internal-".
+                // A network load balancer's host is `<name>-<the ARN's id>.elb.<region>…`
+                // and states its scheme nowhere — the `internal-` prefix is the
+                // application family's form, not this one's.
                 (
                     "NlbDns",
                     Expect {
-                        head: "internal-".to_string(),
                         embeds: Some("NlbName"),
                         separator: "-",
                         digits: ELBV2_DNS_LABEL_DIGITS,
-                        tail: dns_suffix(),
+                        tail: network_dns_suffix(),
                         ..Expect::default()
                     },
                 ),
@@ -496,19 +548,36 @@ Resources:
       Family: !Sub "${{App}}-task"
       TaskRoleArn: !GetAtt TaskRole.Arn
       ContainerDefinitions:{CONTAINER_DEFINITIONS}
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.2.0.0/16
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.2.1.0/24
+      AvailabilityZone: us-east-1a
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.2.2.0/24
+      AvailabilityZone: us-east-1b
   Alb:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
       Name: !Sub "${{App}}-alb"
       Subnets:
-        - subnet-00000000000000001
+        - !Ref SubnetA
+        - !Ref SubnetB
   Tg:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
       Name: !Sub "${{App}}-tg"
       Port: 80
       Protocol: HTTP
-      VpcId: vpc-00000000000000001
+      VpcId: !Ref Vpc
   Listener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
@@ -606,8 +675,9 @@ Outputs:
                     "LoadBalancerDnsName",
                     Expect {
                         head: "web-alb-".to_string(),
-                        embeds: Some("LoadBalancerFullName"),
-                        embeds_after: "/web-alb/",
+                        digits: ALB_DNS_ID_DIGITS,
+                        decimal: true,
+                        or_socket_address: true,
                         tail: dns_suffix(),
                         ..Expect::default()
                     },

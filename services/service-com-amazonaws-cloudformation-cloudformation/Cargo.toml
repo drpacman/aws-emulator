@@ -191,6 +191,15 @@ service-com-amazonaws-autoscaling-autoscaling-2011-01-01 = { workspace = true }
 # service mounted beside CloudFormation, or the create is refused and the stack fails — and
 # the ids the stack publishes are read back through that service's own wire.
 service-com-amazonaws-appconfig-amazonappconfig = { workspace = true }
+# Elastic Load Balancing v2, for the `AWS::ElasticLoadBalancingV2::LoadBalancer`,
+# `::TargetGroup` and `::Listener` a stack really creates there
+# (`state::provisioning::elbv2_resources`): a suite that deploys one must have its owning
+# service mounted beside CloudFormation, or the create is refused and the stack fails.
+service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10 = { workspace = true }
+# Classic Elastic Load Balancing, mounted beside it because it is the front door of the
+# `elasticloadbalancing` endpoint the two generations share: a request naming ELBv2's API
+# version reaches ELBv2 through it, exactly as `core/router` mounts the pair.
+service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7 = { workspace = true }
 
 [lints]
 workspace = true

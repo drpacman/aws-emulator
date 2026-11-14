@@ -1815,6 +1815,15 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// the record name", which is the `Name` its own declaration states.)
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
     resource_type == APIGATEWAYV2_API
+        // The four Elastic Load Balancing v2 types a stack creates in that service are four
+        // more: "Ref returns the ARN" for each, and that ARN carries the id Elastic Load
+        // Balancing assigns (`…/loadbalancer/app/<name>/<id>`, `…/targetgroup/<name>/<id>`,
+        // `…/listener/app/<lb>/<lb id>/<id>`, `…/listener-rule/…/<id>`), which no naming
+        // rule can compute — so the identifier in force is the one the create answered.
+        || resource_type == ELB_LOAD_BALANCER
+        || resource_type == ELB_TARGET_GROUP
+        || resource_type == ELB_LISTENER
+        || resource_type == ELB_LISTENER_RULE
         // A REST API, a resource of one and a deployment of it are three more, for the same
         // reason the API Gateway v2 types below are: `CreateRestApi`, `CreateResource` and
         // `CreateDeployment` each take no identifier for the resource they make and answer

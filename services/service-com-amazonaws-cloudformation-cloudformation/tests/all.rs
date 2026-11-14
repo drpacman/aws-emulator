@@ -129,6 +129,8 @@ mod ecs_elbv2_stack_identifiers;
 // the next change to touch this directory should delete both lines and the file.
 #[path = "all/ecs_elbv2_stack_outputs.rs"]
 mod ecs_elbv2_stack_outputs;
+#[path = "all/elbv2_provisioned_resources.rs"]
+mod elbv2_provisioned_resources;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/estimate_template_cost.rs"]

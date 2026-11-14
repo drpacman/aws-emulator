@@ -217,6 +217,9 @@ pub(super) mod dynamodb_table;
 /// ([`ec2_instance`]).
 mod ec2_instance;
 mod ec2_vpc_network;
+/// The Elastic Load Balancing v2 load balancer, target group, listener and listener rule a
+/// stack declares ([`elbv2_resources`]).
+mod elbv2_resources;
 mod iam_policy;
 /// `AWS::IoT::Authorizer`: the custom authorizer a stack declares, created in AWS IoT
 /// itself ([`iot_authorizer`]).
@@ -762,6 +765,11 @@ pub(super) enum Owner {
     /// target, and the scaling policy that steers one. Which of them it is travels with the
     /// owner, as it does for the types above.
     ApplicationAutoScaling(application_auto_scaling::Kind),
+    /// One of the four `AWS::ElasticLoadBalancingV2::*` types [`elbv2_resources`] creates in
+    /// Elastic Load Balancing: the load balancer, the target group, the listener and the
+    /// listener rule. Which of them it is travels with the owner, as it does for the types
+    /// above.
+    Elbv2Resource(elbv2_resources::Kind),
 }
 
 /// The owner of a template resource type, or `None` for a type this emulator leaves
@@ -823,6 +831,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if let Some(kind) = appconfig_resources::kind_of(resource_type) {
         return Some(Owner::AppConfigResource(kind));
+    }
+    if let Some(kind) = elbv2_resources::kind_of(resource_type) {
+        return Some(Owner::Elbv2Resource(kind));
     }
     provisioner_for(resource_type).map(Owner::Builtin)
 }
@@ -1444,6 +1455,9 @@ pub async fn settle_expired_wait_failures<Eng: Send + Sync + 'static>(
 /// `RetainExceptOnCreate` is documented to override that attribute for a resource the
 /// operation itself created. The OLD physical resource of a replacement is governed by
 /// `UpdateReplacePolicy` instead, so that walk reads no deletion policy either way.
+///
+/// The documents acted on are the ones `declared` carries, as they were resolved before the
+/// walk; [`reconcile_declared`] is the walk that evaluates each declaration again first.
 pub async fn reconcile(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -1453,6 +1467,52 @@ pub async fn reconcile(
     refused: Option<String>,
     removal_policies: Policies,
 ) -> Materialised {
+    // Boxed so the walk's future is a fixed-size handle here: the callers of this function
+    // are themselves deep inside other operations' futures (a rollback, a resumption driven
+    // from a stack read), and inlining the whole walk one level deeper takes the service's
+    // future layout past what the compiler computes.
+    Box::pin(reconcile_declared(
+        ctx,
+        region,
+        stack,
+        declared,
+        previous,
+        refused,
+        removal_policies,
+        None,
+    ))
+    .await
+}
+
+/// [`reconcile`], evaluating each resource's declaration again just before the walk acts on
+/// it, against the records the walk has produced so far ([`Declarations`]) — the deployment a
+/// stack operation makes from its TEMPLATE. `None` is [`reconcile`]: a walk whose documents
+/// are not the template's to re-derive (a rollback putting a previous configuration back, a
+/// resumption whose declarations were just resolved against the records in force).
+#[allow(clippy::too_many_arguments)]
+pub async fn reconcile_declared(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    stack: &StackProvenance,
+    declared: Vec<StoredResource>,
+    previous: &[StoredResource],
+    refused: Option<String>,
+    removal_policies: Policies,
+    declarations: Option<&Declarations>,
+) -> Materialised {
+    // What a declaration evaluated in the walk resolves against: every resource as the
+    // naming rules computed it before the walk, overlaid with each record the walk has
+    // produced so far ([`Materialised::resources`], appended in the order the walk goes) —
+    // so a resource reads the real record of every one it depends on, which the walk's
+    // dependency order has already reached, and the stand-in of nothing else.
+    let mut records: BTreeMap<String, StoredResource> = match declarations {
+        Some(_) => declared
+            .iter()
+            .map(|resource| (resource.logical_id.clone(), resource.clone()))
+            .collect(),
+        None => BTreeMap::new(),
+    };
+    let mut recorded_so_far = 0usize;
     let mut outcome = Materialised {
         // A deployment CLOUDFORMATION itself refused before this walk: nothing is asked of
         // any owning service for it, and every declaration is recorded as the declaration
@@ -1499,14 +1559,27 @@ pub async fn reconcile(
         let Some(mut resource) = declared.next() else {
             break;
         };
+        // The declaration evaluated again, now that every resource it reads has the record
+        // the walk produced for it ([`Declarations`]).
+        if let Some(declarations) = declarations {
+            for produced in &outcome.resources[recorded_so_far..] {
+                records.insert(produced.logical_id.clone(), produced.clone());
+            }
+            recorded_so_far = outcome.resources.len();
+            declarations.resolve(&mut resource, &records);
+        }
         // The resource's record carries the document the stack RECORDS — a secure
         // reference's value is never one of them — while the owning service is asked for
-        // the resource with the resolved one.
-        let resolved = resolutions
-            .remove(&resource.logical_id)
-            .unwrap_or_else(|| {
-                super::dynamic_references::Resolution::verbatim(&resource.properties)
-            });
+        // the resource with the resolved one. The references were resolved before the walk,
+        // from the declaration as it read then; their answers are put into the document
+        // evaluated above.
+        let resolved = match resolutions.remove(&resource.logical_id) {
+            Some(resolution) if declarations.is_some() => {
+                resolution.reapplied(&resource.properties)
+            }
+            Some(resolution) => resolution,
+            None => super::dynamic_references::Resolution::verbatim(&resource.properties),
+        };
         resource.properties = resolved.recorded;
         let mut deployed_properties = resolved.deployed;
         // A property of this resource naming one created EARLIER in this walk carries the
@@ -1516,8 +1589,15 @@ pub async fn reconcile(
         // identifier its service knows the dependency by — and so the comparison below
         // reads an UNCHANGED declaration as unchanged. Both documents the resolution left
         // are re-pointed, since both name that dependency.
-        repoint_references(&mut resource.properties, &minted);
-        repoint_references(&mut deployed_properties, &minted);
+        //
+        // A declaration evaluated again above carries no stand-in to re-point: it already
+        // reads the identities the walk produced, and re-pointing it would rewrite a stand-in
+        // that happens to be a TOKEN of the real value (a generated layer name inside the
+        // layer version ARN Lambda answered) a second time.
+        if declarations.is_none() {
+            repoint_references(&mut resource.properties, &minted);
+            repoint_references(&mut deployed_properties, &minted);
+        }
         if let Some(existing) = previous
             .iter()
             .find(|existing| already_deployed(existing) && is_same_resource(existing, &resource))
@@ -2500,6 +2580,63 @@ fn retokenised(text: &str, stand_in: &str, assigned: &str) -> Option<String> {
     }
     repointed.push_str(&text[cursor..]);
     Some(repointed)
+}
+
+/// A deployment's declarations, as [`reconcile`] evaluates each one again just before acting
+/// on the resource it declares — owned, because the walk runs outside the store lock
+/// ([`super::StoredStack::declarations`]).
+///
+/// ## Why a declaration is evaluated again
+///
+/// CloudFormation resolves a resource's `Ref`s and `Fn::GetAtt`s when it PROVISIONS the
+/// resource, against what the resources it depends on were really created as. Before the
+/// walk the only values to hand are the ones the naming rules computed — stand-ins for
+/// whatever an owning service goes on to assign — so a declaration resolved then can carry
+/// an identifier no service holds, or lack an attribute only the service reports. The walk
+/// creates resources in dependency order, so by the time it reaches a resource every one it
+/// reads has its real record, and evaluating the declaration THEN gives the document
+/// CloudFormation would have sent: an id the service minted, embedded however the template
+/// composes it, and an attribute its create answered with.
+#[derive(Debug, Clone)]
+pub struct Declarations {
+    pub template: super::template::Template,
+    pub parameters: BTreeMap<String, String>,
+    pub parameter_types: BTreeMap<String, String>,
+    pub imports: BTreeMap<String, String>,
+    pub stack_outputs: super::stack_outputs::Values,
+    pub region: String,
+    pub stack_name: String,
+    pub stack_id: String,
+    pub notification_arns: Vec<String>,
+}
+
+impl Declarations {
+    /// Evaluate `resource`'s declaration again against `records`, the resources as they stand
+    /// at this point of the walk, replacing the properties it was resolved with before.
+    fn resolve(&self, resource: &mut StoredResource, records: &BTreeMap<String, StoredResource>) {
+        let scope = super::template::Scope {
+            stack: super::template::StackScope {
+                region: &self.region,
+                stack_name: &self.stack_name,
+                stack_id: &self.stack_id,
+                notification_arns: &self.notification_arns,
+            },
+            parameters: &self.parameters,
+            parameter_types: &self.parameter_types,
+            resources: records,
+            mappings: &self.template.mappings,
+            conditions: &self.template.conditions,
+            imports: &self.imports,
+            stack_outputs: &self.stack_outputs,
+        };
+        let mut budget = super::template::Budget::new();
+        super::template::resolve_properties(
+            &self.template,
+            ::std::slice::from_mut(resource),
+            &scope,
+            &mut budget,
+        );
+    }
 }
 
 /// Record the identity an owning service ASSIGNED to a resource it created: the id its

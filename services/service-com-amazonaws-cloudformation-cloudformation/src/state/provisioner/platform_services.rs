@@ -1357,11 +1357,31 @@ pub(super) fn record_set_element(resource: &StoredResource) -> Result<String, Re
         let Some(declared) = resource.properties.get(*name) else {
             continue;
         };
-        if let Some(written) = route53_member(name, *member, declared)? {
+        let declared = with_resource_type_defaults(name, declared);
+        if let Some(written) = route53_member(name, *member, &declared)? {
             rendered.push_str(&written);
         }
     }
     Ok(format!("<ResourceRecordSet>{rendered}</ResourceRecordSet>"))
+}
+
+/// `declared` with the values the resource type supplies for members a template may leave
+/// out but the API requires.
+///
+/// `AliasTarget.EvaluateTargetHealth` is optional on `AWS::Route53::RecordSet` and
+/// defaults to `false`, while `ChangeResourceRecordSets` requires it on every
+/// `AliasTarget`. So an alias that does not state it is sent with `false`, as the type's
+/// handler sends it.
+fn with_resource_type_defaults(name: &str, declared: &Value) -> Value {
+    let mut declared = declared.clone();
+    if name == "AliasTarget" {
+        if let Value::Object(target) = &mut declared {
+            target
+                .entry("EvaluateTargetHealth")
+                .or_insert(Value::Bool(false));
+        }
+    }
+    declared
 }
 
 /// The hosted zone a record set's declaration names, as the id Route 53 addresses it by.

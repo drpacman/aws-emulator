@@ -927,6 +927,28 @@ impl StoredStack {
         unresolved
     }
 
+    /// What the deployment in flight resolves its declarations against, OWNED so it can be
+    /// carried outside the store lock into the walk that creates the resources
+    /// ([`provisioning::reconcile`]): the processed template, the parameters, imports and
+    /// other stacks' outputs in force, and the stack's own identity. `None` for a stack with
+    /// no deployment in flight or no template this service can read.
+    pub fn declarations(&self) -> Option<provisioning::Declarations> {
+        let (template, parameters) = self.template_scope()?;
+        let deployment = self.pending_deployment.as_ref()?;
+        let parameter_types = ssm_parameters::parameter_types_in_force(&template);
+        Some(provisioning::Declarations {
+            template,
+            parameters,
+            parameter_types,
+            imports: deployment.imports.clone(),
+            stack_outputs: deployment.stack_outputs.clone(),
+            region: self.region.clone(),
+            stack_name: self.stack_name.clone(),
+            stack_id: self.stack_id.clone(),
+            notification_arns: self.notification_arns.clone(),
+        })
+    }
+
     /// The stack's `Description`: the template's own `Description`, which is where
     /// CloudFormation takes both `Stack$Description` and
     /// `StackSummary$TemplateDescription` from.
@@ -2509,6 +2531,18 @@ impl StoredStack {
     /// The resources the stack has RIGHT NOW: the ones the operation in flight is about to
     /// install while it is still in flight, else the ones its last completed operation
     /// left. This is the set a stack's deletion has to delete.
+    /// The PRE-DEPLOYMENT property validation of the deployment in force
+    /// ([`property_validation::failure`]): its resolved resources, judged against the
+    /// template's own declarations so a property reading another resource's attribute is
+    /// not mistaken for one the template left out.
+    pub fn property_validation_failure(&self) -> Option<property_validation::PropertyFailure> {
+        let declarations = self
+            .template_scope()
+            .map(|(declared, _)| declared.resources)
+            .unwrap_or_default();
+        property_validation::failure(&self.current_resources(), &declarations)
+    }
+
     pub fn current_resources(&self) -> Vec<StoredResource> {
         match &self.pending_deployment {
             Some(deployment) => deployment.resources.clone(),

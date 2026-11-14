@@ -243,3 +243,81 @@ fn published_attribute_names_are_the_catalogued_return_values() {
         );
     }
 }
+
+/// RULE: adopting the identity an owning service assigned brings the uniform
+/// `Arn`/`<Type>Arn` into step with it wherever the convention read them off the identity
+/// being replaced — the ARN that IS the id, and the ARN whose last segment is the id — and
+/// leaves an ARN set some other way alone.
+#[test]
+fn adopting_an_identity_brings_the_arn_read_off_it_into_step() {
+    let stand_in_arn = "arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/app/lb/aaaa";
+    let minted_arn = "arn:aws:elasticloadbalancing:us-east-1:000000000000:loadbalancer/app/lb/bbbb";
+    // (case, type, the id replaced, the Arn it carried, the id adopted, the Arn expected)
+    let rows: &[(&str, &str, &str, &str, &str, &str)] = &[
+        (
+            "a type whose Ref is its ARN",
+            "AWS::ElasticLoadBalancingV2::LoadBalancer",
+            stand_in_arn,
+            stand_in_arn,
+            minted_arn,
+            minted_arn,
+        ),
+        (
+            "a type whose ARN ends in its id after a slash",
+            "AWS::EC2::Instance",
+            "i-0000000000000000a",
+            "arn:aws:ec2:us-east-1:000000000000:instance/i-0000000000000000a",
+            "i-0123456789abcdef0",
+            "arn:aws:ec2:us-east-1:000000000000:instance/i-0123456789abcdef0",
+        ),
+        (
+            "a type whose ARN ends in its id after a colon",
+            "AWS::Example::Thing",
+            "thing-1",
+            "arn:aws:example:us-east-1:000000000000:thing:thing-1",
+            "thing-2",
+            "arn:aws:example:us-east-1:000000000000:thing:thing-2",
+        ),
+        (
+            "an ARN not read off the id is left alone",
+            "AWS::EC2::Instance",
+            "i-0000000000000000a",
+            "arn:aws:ec2:us-east-1:000000000000:instance/some-name",
+            "i-0123456789abcdef0",
+            "arn:aws:ec2:us-east-1:000000000000:instance/some-name",
+        ),
+        (
+            "an id only a SUFFIX of the last segment is not a match",
+            "AWS::EC2::Instance",
+            "a",
+            "arn:aws:ec2:us-east-1:000000000000:instance/xa",
+            "b",
+            "arn:aws:ec2:us-east-1:000000000000:instance/xa",
+        ),
+    ];
+    for (case, resource_type, replaced, arn, adopted, expected) in rows {
+        let segment = resource_type.rsplit("::").next().unwrap_or_default();
+        let mut resource = StoredResource {
+            logical_id: "R".to_string(),
+            resource_type: (*resource_type).to_string(),
+            physical_resource_id: (*replaced).to_string(),
+            attributes: BTreeMap::from([
+                ("Arn".to_string(), (*arn).to_string()),
+                (format!("{segment}Arn"), (*arn).to_string()),
+            ]),
+            metadata: None,
+            properties: Value::Null,
+            materialised: false,
+            deletion_policy: None,
+        };
+        adopt_identity(&mut resource, (*adopted).to_string());
+        for attribute in ["Arn".to_string(), format!("{segment}Arn")] {
+            assert_eq!(
+                resource.attributes.get(&attribute).map(String::as_str),
+                Some(*expected),
+                "case {case:?}: {attribute}"
+            );
+        }
+        assert_eq!(resource.physical_resource_id, *adopted, "case {case:?}: physical id");
+    }
+}
